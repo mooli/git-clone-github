@@ -1,0 +1,189 @@
+#!/usr/bin/env perl
+#use diagnostics;
+use strictures 2;
+use 5.010;
+
+=head1 NAME
+
+git-clone-github - Batch-clone repositories.
+
+=head1 SYNOPSIS
+
+git-clone-github [-bghjouvy] [long options...]
+
+=head1 DESCRIPTION
+
+
+This grungy script was prompted by Jason Scott's tweet
+L<https://twitter.com/textfiles/status/1118783740661194752>. It is useful for batch-downloading
+multiple repositories from GitHub or something that has a close-enough API. It also saves the
+relevant JSON "item" fragment for that repository for later perusal.
+
+It merely parses the minimum necessary from the JSON returned by the API and does not generate
+GitHub API URLs, so you will have to do that yourself, e.g. by consulting the documentation at
+L<https://developer.github.com/v3/>.
+
+Alternatively, you can provide the path of a JSON document (with B<--json>). This might be one
+you have already downloaded via e.g. curl, or one of the saved fragments from a previous run
+which failed.
+
+=head1 EXAMPLES
+
+ # Download all of my repositories to /tmp. This repository will end up in
+ # /tmp/mooli/git-clone-github.git.
+
+ git-clone-github -v -o /tmp/ --bare -u https://api.github.com/users/mooli/repos
+
+ # Search for and download repositories matching a pattern.
+
+ git-clone-github -v -o /tmp/ --bare -u \
+   https://api.github.com/search/repositories?q=infocom+user:historicalsource
+
+=head1 LICENCE
+
+This has the same licence as Perl: L<https://dev.perl.org/licenses/>.
+
+=cut
+
+#use Carp::Always;
+use Getopt::Long::Descriptive;
+use JSON;
+use LWP;
+use Path::Class qw( dir file );
+use Scalar::Util qw( reftype );
+
+my $has_pp;
+
+BEGIN {
+    $has_pp = eval "use Data::Dump::Color qw( pp ); 1" // eval "use Data::Dump qw( pp ); 1" // 0;
+}
+
+sub escape($) {
+    my $text = shift;
+    return pp("$text") if $has_pp;
+    return '"' . join(
+        '',
+        map {
+            if    (/[\\"]/)       { "\\$_" }
+            elsif (/[\020-\176]/) { $_ }
+            else                  { sprintf "\\x%02X", ord }
+        } split //,
+        $text
+    ) . '"';
+}
+
+my ($opt, $usage) = describe_options(
+    "%c %o [filename...]",
+    [],
+    [
+        "source" => hidden => {
+            one_of => [
+                [ 'json|j=s', 'Use this already-fetched JSON file' ],
+                [ 'url|u=s',  'Fetch JSON from this URL' ],
+            ] }
+    ],
+    [ 'output|o=s', 'Output directory', { required => 1 } ],
+    [],
+    [ 'bare|b', 'Make a bare clone' ],
+    [ 'gc|g', 'Run "git gc" on the clone', { default => 1 } ],
+    [],
+    [ 'dry-run|y', 'Avoid mutating/expensive operations' ],
+    [ 'help|h',     'Print this help text', { shortcircuit => 1 } ],
+    [ 'verbose|v+', 'Verbose operation',    { default      => 0 } ],
+);
+
+if ($opt->help) {
+    print $usage->text;
+    exit 0;
+}
+
+my $output  = dir($opt->output);
+my $dry_run = $opt->dry_run;
+my $verbose = $opt->verbose;
+my $bare    = $opt->bare;
+my $gc      = $opt->gc;
+
+sub system_or_dry(@) {
+    my $pretty_cmd = join ' ', map(escape $_, @_);
+    if ($dry_run) {
+        say STDERR "Would run $pretty_cmd";
+    } else {
+        say STDERR "Running $pretty_cmd" if $verbose;
+        system(@_) == 0 or die "system($pretty_cmd) failed: $?";
+    }
+}
+
+sub item {
+    my ($item) = @_;
+    my ($full_name, $clone_url) = @{$item}{qw( full_name clone_url )};
+    my ($user, $repo) = split m~/~, $full_name, 2;
+    for ($user, $repo) {
+        die "$full_name is not a sane path" if m~/~ or /^[.]/;
+    }
+    my $userdir = $output->subdir($user);
+
+    my @clone = qw( git clone --mirror );
+    my $git_dir;
+    if ($bare) {
+        $git_dir = $userdir->subdir("$repo.git");
+        push @clone, '--bare', $clone_url, $git_dir;
+    } else {
+        $git_dir = $userdir->subdir($repo, ".git");
+        push @clone, $clone_url, $userdir->subdir($repo);
+    }
+
+    if (-d $git_dir) {
+        printf STDERR "%s already exists; skipping clone\n", escape($git_dir);
+        return;
+    }
+
+    system_or_dry(qw( mkdir -p ), $userdir);
+
+    my $json_path = $userdir->file("$repo.json");
+    $json_path->spew(encode_json($item));
+
+    system_or_dry(@clone);
+    system_or_dry(qw( git --git-dir ), $git_dir, 'gc') if $gc;
+}
+
+my $json;
+if ($opt->source eq 'json') {
+    $json = file($opt->json)->slurp;
+} elsif ($opt->source eq 'url') {
+    my $url = $opt->url;
+    my $ua  = LWP::UserAgent->new(
+        verbose => !!$verbose,
+    );
+
+    #$ua->agent("MyApp/0.1 ");
+
+    my $req = HTTP::Request->new(GET => $url);
+    $req->header('Accept', 'application/json; q=1.0, */*; q=0.1');
+    printf STDERR "Fetching %s.\n", escape($url) if $verbose;
+    my $res = $ua->request($req);
+    die sprintf "Failed to fetch %s: %s", escape($url), $res->status_line unless $res->is_success;
+    $json = $res->content;
+} else {
+    die "You need to provide some source of input.\n\n$usage\n";
+}
+
+my $decoded = decode_json($json);
+my $items;
+if(eval { exists $decoded->{clone_url} } ){
+    # This is a single raw item, e.g. one of the per-repository JSON files we saved on a
+    # previous run.
+    $items = [ $decoded ];
+}elsif(eval { exists $decoded->[0]{clone_url} } ){
+    # This is a plain list of items, e.g from https://api.github.com/users/:USER/repos.
+    $items = $decoded;
+} elsif(eval { exists $decoded->{items}[0]{clone_url} }) {
+    # This has a list of items in the key "items", e.g. from
+    # https://api.github.com/search/repositories?q=:query
+    $items = $decoded->{items};
+} else {
+    die "Not sure how to find items in that JSON";
+}
+
+foreach my $item (@$items) {
+    item($item);
+}
