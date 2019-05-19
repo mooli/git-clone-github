@@ -77,19 +77,22 @@ my ($opt, $usage) = describe_options(
     [],
     [
         "source" => hidden => {
-            one_of => [
+            required => 1,
+            one_of   => [
                 [ 'json|j=s', 'Use this already-fetched JSON file' ],
                 [ 'url|u=s',  'Fetch JSON from this URL' ],
             ] }
     ],
     [ 'output|o=s', 'Output directory', { required => 1 } ],
     [],
-    [ 'bare|b', 'Make a bare clone' ],
-    [ 'gc|g', 'Run "git gc" on the clone', { default => 1 } ],
+    [ 'bare|b', 'Make a bare clone', { default => 'true' } ],
+    [ 'fork|f', 'Also download forked repositories' ],
+    [ 'gc|g',   'Run "git gc" on the clone', { default => 'true' } ],
     [],
     [ 'dry-run|y', 'Avoid mutating/expensive operations' ],
     [ 'help|h',     'Print this help text', { shortcircuit => 1 } ],
-    [ 'verbose|v+', 'Verbose operation',    { default      => 0 } ],
+    [ 'verbose|v+', 'Verbose operation' ],
+    { show_defaults => 1 },
 );
 
 if ($opt->help) {
@@ -151,9 +154,7 @@ if ($opt->source eq 'json') {
     $json = file($opt->json)->slurp;
 } elsif ($opt->source eq 'url') {
     my $url = $opt->url;
-    my $ua  = LWP::UserAgent->new(
-        verbose => !!$verbose,
-    );
+    my $ua = LWP::UserAgent->new(verbose => !!$verbose,);
 
     #$ua->agent("MyApp/0.1 ");
 
@@ -169,14 +170,21 @@ if ($opt->source eq 'json') {
 
 my $decoded = decode_json($json);
 my $items;
-if(eval { exists $decoded->{clone_url} } ){
+if (eval { exists $decoded->{clone_url} }) {
+
     # This is a single raw item, e.g. one of the per-repository JSON files we saved on a
     # previous run.
-    $items = [ $decoded ];
-}elsif(eval { exists $decoded->[0]{clone_url} } ){
+    $items = [$decoded];
+} elsif (eval {
+    exists $decoded->[0]{clone_url};
+}) {
+
     # This is a plain list of items, e.g from https://api.github.com/users/:USER/repos.
     $items = $decoded;
-} elsif(eval { exists $decoded->{items}[0]{clone_url} }) {
+} elsif (eval {
+    exists $decoded->{items}[0]{clone_url};
+}) {
+
     # This has a list of items in the key "items", e.g. from
     # https://api.github.com/search/repositories?q=:query
     $items = $decoded->{items};
@@ -185,5 +193,6 @@ if(eval { exists $decoded->{clone_url} } ){
 }
 
 foreach my $item (@$items) {
+    next if $opt->fork && $item->{fork};
     item($item);
 }
